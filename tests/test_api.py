@@ -242,6 +242,105 @@ def test_large_image():
         return False
 
 
+def test_batch_error_handling():
+    print("\n=== Testing Batch Error Handling (207 Multi-Status) ===")
+    try:
+        files = []
+        
+        img_bytes1 = create_test_image((128, 128))
+        files.append(("files", ("good_1.png", img_bytes1, "image/png")))
+        
+        corrupt_bytes = b"This is not a valid image file"
+        files.append(("files", ("corrupt.png", corrupt_bytes, "image/png")))
+        
+        img_bytes2 = create_test_image((64, 64))
+        files.append(("files", ("good_2.png", img_bytes2, "image/png")))
+        
+        params = {"scale": 4, "wait": "true"}
+        
+        response = requests.post(
+            f"{BASE_URL}/batch/super-resolve",
+            files=files,
+            params=params
+        )
+        
+        print(f"Status: {response.status_code}")
+        assert response.status_code == 207, f"Expected 207 Multi-Status, got {response.status_code}"
+        
+        data = response.json()
+        
+        print(f"Success: {data['success']}")
+        print(f"Batch size: {data['batch_size']}")
+        print(f"Success count: {data['success_count']}")
+        print(f"Failed count: {data['failed_count']}")
+        
+        assert data['success'] == False
+        assert data['batch_size'] == 3
+        assert data['success_count'] == 2
+        assert data['failed_count'] == 1
+        
+        for i, result in enumerate(data['results']):
+            print(f"  Item {i}: {result['filename']} - status={result['status']}")
+            if result['status'] == 'failed':
+                print(f"    Error: {result['error']}")
+                assert result['error'] is not None
+                assert result['image_data'] is None
+                assert result['metrics'] is None
+                assert result['blur_analysis'] is None
+            else:
+                assert result['error'] is None
+                assert result['image_data'] is not None
+                assert result['metrics'] is not None
+                assert result['blur_analysis'] is not None
+        
+        assert data['results'][0]['status'] == 'success'
+        assert data['results'][1]['status'] == 'failed'
+        assert data['results'][2]['status'] == 'success'
+        
+        print("✓ Batch error handling (207 Multi-Status) OK")
+        return True
+    except Exception as e:
+        print(f"✗ Batch error handling failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def test_batch_all_good_returns_200():
+    print("\n=== Testing Batch All Good Returns 200 ===")
+    try:
+        files = []
+        for i in range(2):
+            img_bytes = create_test_image((128, 128))
+            files.append(("files", (f"good_{i}.png", img_bytes, "image/png")))
+        
+        params = {"scale": 2, "wait": "true"}
+        
+        response = requests.post(
+            f"{BASE_URL}/batch/super-resolve",
+            files=files,
+            params=params
+        )
+        
+        print(f"Status: {response.status_code}")
+        assert response.status_code == 200
+        
+        data = response.json()
+        assert data['success'] == True
+        assert data['success_count'] == 2
+        assert data['failed_count'] == 0
+        
+        for result in data['results']:
+            assert result['status'] == 'success'
+            assert result['error'] is None
+        
+        print("✓ Batch all good returns 200 OK")
+        return True
+    except Exception as e:
+        print(f"✗ Batch all good returns 200 failed: {e}")
+        return False
+
+
 def test_different_blur_types():
     print("\n=== Testing Different Blur Types ===")
     try:
@@ -297,6 +396,8 @@ def main():
         test_single_image_super_resolve,
         test_json_response,
         test_batch_processing,
+        test_batch_error_handling,
+        test_batch_all_good_returns_200,
         test_large_image,
         test_different_blur_types
     ]

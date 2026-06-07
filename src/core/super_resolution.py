@@ -68,19 +68,48 @@ class SuperResolutionProcessor:
         results = []
         all_metrics = []
         all_blur_analyses = []
+        errors = []
+        statuses = []
         
         for i, img in enumerate(images):
-            result = await self._process_single_image(img, scale)
-            results.append(result['output_image'])
-            all_metrics.append(result['metrics'])
-            all_blur_analyses.append(result['blur_analysis'])
+            if isinstance(img, dict) and img.get('error'):
+                results.append(None)
+                all_metrics.append(None)
+                all_blur_analyses.append(None)
+                errors.append(img['error'])
+                statuses.append('failed')
+                continue
+            
+            try:
+                result = await self._process_single_image(img, scale)
+                results.append(result['output_image'])
+                all_metrics.append(result['metrics'])
+                all_blur_analyses.append(result['blur_analysis'])
+                errors.append(None)
+                statuses.append('success')
+            except Exception as e:
+                results.append(None)
+                all_metrics.append(None)
+                all_blur_analyses.append(None)
+                errors.append(str(e))
+                statuses.append('failed')
+        
+        success_count = sum(1 for s in statuses if s == 'success')
+        failed_count = sum(1 for s in statuses if s == 'failed')
+        total_metrics_time = sum(
+            m.processing_time_ms for m in all_metrics if m is not None
+        )
         
         return {
             'output_images': results,
             'metrics_list': all_metrics,
             'blur_analyses': all_blur_analyses,
+            'errors': errors,
+            'statuses': statuses,
+            'success_count': success_count,
+            'failed_count': failed_count,
             'batch_size': len(images),
-            'total_processing_time_ms': sum(m.processing_time_ms for m in all_metrics)
+            'total_processing_time_ms': total_metrics_time
         }
     
     async def _process_single_image(self, img: np.ndarray, scale: int) -> Dict[str, Any]:

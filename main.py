@@ -207,6 +207,7 @@ async def batch_super_resolve(
     
     images = []
     filenames = []
+    read_errors = []
     
     for file in files:
         try:
@@ -214,8 +215,14 @@ async def batch_super_resolve(
             img = bytes_to_image(contents)
             images.append(img)
             filenames.append(file.filename)
+            read_errors.append(None)
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Invalid image file {file.filename}: {str(e)}")
+            error_msg = f"Invalid image file {file.filename}: {str(e)}"
+            images.append({"error": error_msg})
+            filenames.append(file.filename)
+            read_errors.append(error_msg)
+    
+    has_read_errors = any(e is not None for e in read_errors)
     
     request_item = await app.state.request_queue.submit(images, scale)
     
@@ -234,43 +241,83 @@ async def batch_super_resolve(
             timeout=300.0
         )
     except TimeoutError:
-        return {
-            "success": False,
-            "request_id": request_item.request_id,
-            "status": "timeout",
-            "message": "Processing timed out. Use /batch/status/{request_id} to check status."
-        }
+        return JSONResponse(
+            status_code=207,
+            content={
+                "success": False,
+                "request_id": request_item.request_id,
+                "status": "timeout",
+                "message": "Processing timed out. Use /batch/status/{request_id} to check status."
+            }
+        )
     
     if completed_item.status != RequestStatus.COMPLETED:
-        return {
-            "success": False,
-            "request_id": completed_item.request_id,
-            "status": completed_item.status.value,
-            "error": completed_item.error
-        }
+        return JSONResponse(
+            status_code=500,
+            content={
+                "success": False,
+                "request_id": completed_item.request_id,
+                "status": completed_item.status.value,
+                "error": completed_item.error
+            }
+        )
     
     result = completed_item.result
     
-    output_images = []
-    for i, output_img in enumerate(result['output_images']):
-        output_bytes = image_to_bytes(output_img, format="PNG")
-        output_base64 = base64.b64encode(output_bytes).decode('utf-8')
-        output_images.append({
-            "filename": filenames[i],
-            "image_data": f"data:image/png;base64,{output_base64}",
-            "metrics": serialize_metrics(result['metrics_list'][i]),
-            "blur_analysis": serialize_blur_analysis(result['blur_analyses'][i])
-        })
+    results = []
+    has_processing_errors = False
     
-    return {
-        "success": True,
-        "request_id": completed_item.request_id,
-        "scale": scale,
-        "batch_size": result['batch_size'],
-        "total_processing_time_ms": round(result['total_processing_time_ms'], 2),
-        "processing_time_ms": round((completed_item.processing_end - completed_item.processing_start) * 1000, 2) if completed_item.processing_end and completed_item.processing_start else None,
-        "results": output_images
-    }
+    for i in range(len(filenames)):
+        status = result['statuses'][i]
+        error = result['errors'][i]
+        
+        if status == 'success' and result['output_images'][i] is not None:
+            output_img = result['output_images'][i]
+            output_bytes = image_to_bytes(output_img, format="PNG")
+            output_base64 = base64.b64encode(output_bytes).decode('utf-8')
+            
+            results.append({
+                "status": "success",
+                "filename": filenames[i],
+                "image_data": f"data:image/png;base64,{output_base64}",
+                "metrics": serialize_metrics(result['metrics_list'][i]),
+                "blur_analysis": serialize_blur_analysis(result['blur_analyses'][i]),
+                "error": None
+            })
+        else:
+            has_processing_errors = True
+            results.append({
+                "status": "failed",
+                "filename": filenames[i],
+                "image_data": None,
+                "metrics": None,
+                "blur_analysis": None,
+                "error": error
+            })
+    
+    has_any_errors = has_read_errors or has_processing_errors
+    status_code = 207 if has_any_errors else 200
+    
+    processing_time_ms = None
+    if completed_item.processing_end and completed_item.processing_start:
+        processing_time_ms = round(
+            (completed_item.processing_end - completed_item.processing_start) * 1000, 2
+        )
+    
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "success": not has_any_errors,
+            "request_id": completed_item.request_id,
+            "scale": scale,
+            "batch_size": result['batch_size'],
+            "success_count": result['success_count'],
+            "failed_count": result['failed_count'],
+            "total_processing_time_ms": round(result['total_processing_time_ms'], 2),
+            "processing_time_ms": processing_time_ms,
+            "results": results
+        }
+    )
 
 
 @app.get("/batch/status/{request_id}")
@@ -301,8 +348,20 @@ async def get_batch_status(request_id: str):
     if item.status == RequestStatus.COMPLETED and item.result:
         response["summary"] = {
             "batch_size": item.result.get('batch_size', len(item.images)),
+            "success_count": item.result.get('success_count', 0),
+            "failed_count": item.result.get('failed_count', 0),
             "total_processing_time_ms": round(item.result.get('total_processing_time_ms', 0), 2)
         }
+        
+        if 'statuses' in item.result:
+            response["item_statuses"] = [
+                {
+                    "index": i,
+                    "status": s,
+                    "error": item.result.get('errors', [])[i] if item.result.get('errors') else None
+                }
+                for i, s in enumerate(item.result['statuses'])
+            ]
     
     return response
 
