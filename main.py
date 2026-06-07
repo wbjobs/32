@@ -19,7 +19,9 @@ from src.queue import RequestQueue, RequestStatus
 from src.utils import (
     bytes_to_image,
     image_to_bytes,
-    PerformanceMetrics
+    PerformanceMetrics,
+    serialize_metrics,
+    serialize_blur_analysis
 )
 from src.processing import BlurType, BlurAnalysis
 
@@ -48,31 +50,6 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan
 )
-
-
-def serialize_metrics(metrics: PerformanceMetrics) -> Dict[str, Any]:
-    return {
-        "processing_time_ms": round(metrics.processing_time_ms, 2),
-        "peak_memory_usage_mb": round(metrics.peak_memory_usage_mb, 2),
-        "gpu_memory_usage_mb": round(metrics.gpu_memory_usage_mb, 2) if metrics.gpu_memory_usage_mb else None,
-        "cpu_usage_percent": round(metrics.cpu_usage_percent, 2),
-        "input_size": metrics.input_size,
-        "output_size": metrics.output_size,
-        "tile_count": metrics.tile_count,
-        "blur_detection_time_ms": round(metrics.blur_detection_time_ms, 2),
-        "inference_time_ms": round(metrics.inference_time_ms, 2),
-        "preprocessing_time_ms": round(metrics.preprocessing_time_ms, 2),
-        "postprocessing_time_ms": round(metrics.postprocessing_time_ms, 2)
-    }
-
-
-def serialize_blur_analysis(analysis: BlurAnalysis) -> Dict[str, Any]:
-    return {
-        "blur_type": analysis.blur_type.value,
-        "confidence": round(analysis.confidence, 4),
-        "severity": round(analysis.severity, 4),
-        "details": {k: round(float(v), 4) for k, v in analysis.details.items()}
-    }
 
 
 @app.get("/")
@@ -142,6 +119,7 @@ async def super_resolve(
     output_img = result['output_images'][0]
     metrics = result['metrics_list'][0]
     blur_analysis = result['blur_analyses'][0]
+    cache_hit = result.get('cache_hits', [False])[0]
     
     output_bytes = image_to_bytes(output_img, format=output_format.upper())
     
@@ -152,8 +130,9 @@ async def super_resolve(
     
     response.headers["X-Processing-Time-MS"] = str(round(metrics.processing_time_ms, 2))
     response.headers["X-Memory-Usage-MB"] = str(round(metrics.peak_memory_usage_mb, 2))
-    response.headers["X-Blur-Type"] = blur_analysis.blur_type.value
-    response.headers["X-Blur-Confidence"] = str(round(blur_analysis.confidence, 4))
+    response.headers["X-Blur-Type"] = blur_analysis.blur_type.value if hasattr(blur_analysis, 'blur_type') else blur_analysis.get('blur_type', 'unknown')
+    response.headers["X-Blur-Confidence"] = str(round(blur_analysis.confidence, 4) if hasattr(blur_analysis, 'confidence') else blur_analysis.get('confidence', 0))
+    response.headers["X-Cache-Hit"] = "true" if cache_hit else "false"
     
     return response
 
@@ -177,6 +156,7 @@ async def super_resolve_json(
     output_img = result['output_images'][0]
     metrics = result['metrics_list'][0]
     blur_analysis = result['blur_analyses'][0]
+    cache_hit = result.get('cache_hits', [False])[0]
     
     output_bytes = image_to_bytes(output_img, format="PNG")
     output_base64 = base64.b64encode(output_bytes).decode('utf-8')
@@ -186,7 +166,8 @@ async def super_resolve_json(
         "output_image": f"data:image/png;base64,{output_base64}",
         "metrics": serialize_metrics(metrics),
         "blur_analysis": serialize_blur_analysis(blur_analysis),
-        "scale": scale
+        "scale": scale,
+        "cache_hit": cache_hit
     }
 
 
@@ -266,10 +247,12 @@ async def batch_super_resolve(
     
     results = []
     has_processing_errors = False
+    cache_hits = result.get('cache_hits', [])
     
     for i in range(len(filenames)):
         status = result['statuses'][i]
         error = result['errors'][i]
+        cache_hit = cache_hits[i] if i < len(cache_hits) else False
         
         if status == 'success' and result['output_images'][i] is not None:
             output_img = result['output_images'][i]
@@ -282,6 +265,7 @@ async def batch_super_resolve(
                 "image_data": f"data:image/png;base64,{output_base64}",
                 "metrics": serialize_metrics(result['metrics_list'][i]),
                 "blur_analysis": serialize_blur_analysis(result['blur_analyses'][i]),
+                "cache_hit": cache_hit,
                 "error": None
             })
         else:
@@ -292,6 +276,7 @@ async def batch_super_resolve(
                 "image_data": None,
                 "metrics": None,
                 "blur_analysis": None,
+                "cache_hit": False,
                 "error": error
             })
     
@@ -304,6 +289,8 @@ async def batch_super_resolve(
             (completed_item.processing_end - completed_item.processing_start) * 1000, 2
         )
     
+    cache_hit_count = result.get('cache_hit_count', 0)
+    
     return JSONResponse(
         status_code=status_code,
         content={
@@ -313,6 +300,7 @@ async def batch_super_resolve(
             "batch_size": result['batch_size'],
             "success_count": result['success_count'],
             "failed_count": result['failed_count'],
+            "cache_hit_count": cache_hit_count,
             "total_processing_time_ms": round(result['total_processing_time_ms'], 2),
             "processing_time_ms": processing_time_ms,
             "results": results
@@ -350,14 +338,17 @@ async def get_batch_status(request_id: str):
             "batch_size": item.result.get('batch_size', len(item.images)),
             "success_count": item.result.get('success_count', 0),
             "failed_count": item.result.get('failed_count', 0),
+            "cache_hit_count": item.result.get('cache_hit_count', 0),
             "total_processing_time_ms": round(item.result.get('total_processing_time_ms', 0), 2)
         }
         
         if 'statuses' in item.result:
+            cache_hits = item.result.get('cache_hits', [])
             response["item_statuses"] = [
                 {
                     "index": i,
                     "status": s,
+                    "cache_hit": cache_hits[i] if i < len(cache_hits) else False,
                     "error": item.result.get('errors', [])[i] if item.result.get('errors') else None
                 }
                 for i, s in enumerate(item.result['statuses'])
@@ -385,6 +376,60 @@ async def analyze_image_blur(file: UploadFile = File(...)):
     return {
         "success": True,
         "blur_analysis": serialize_blur_analysis(blur_analysis)
+    }
+
+
+@app.get("/cache/stats")
+async def get_cache_stats():
+    stats = app.state.processor.get_cache_stats()
+    return {
+        "success": True,
+        "cache_enabled": stats is not None,
+        "stats": stats if stats else {}
+    }
+
+
+@app.get("/cache/recent")
+async def get_cache_recent(count: int = 10):
+    recent = app.state.processor.get_cache_recent(count=count)
+    return {
+        "success": True,
+        "count": len(recent),
+        "recent": recent
+    }
+
+
+@app.post("/cache/clear")
+async def clear_cache(clear_redis: bool = True):
+    app.state.processor.clear_cache(clear_redis=clear_redis)
+    return {
+        "success": True,
+        "message": f"Cache cleared (redis: {'yes' if clear_redis else 'no'})"
+    }
+
+
+@app.post("/cache/compute-hash")
+async def compute_image_hash(
+    file: UploadFile = File(...),
+    scale: int = 4
+):
+    try:
+        contents = await file.read()
+        img = bytes_to_image(contents)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid image file: {str(e)}")
+    
+    processor = app.state.processor
+    if processor.cache is None:
+        raise HTTPException(status_code=503, detail="Cache not initialized")
+    
+    cache_key = processor.cache.compute_key(img, scale)
+    
+    return {
+        "success": True,
+        "cache_key": cache_key,
+        "scale": scale,
+        "in_cache": processor.cache.contains(cache_key)
     }
 
 
